@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite it as below; the dataset has its own citation in README.md."
+title: "ESCI product search: fine-tuning an embedding model and a reranker on the Amazon Shopping Queries Dataset"
+type: software
+authors:
+  - family-names: Deshmukh
+    given-names: Omkar
+year: 2026
+license: MIT
+repository-code: "https://github.com/crossvalidator/esci-product-search"

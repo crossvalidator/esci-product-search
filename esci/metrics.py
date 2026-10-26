@@ -31,7 +31,7 @@ CUTOFFS = (10, 20, 50)
 def qrels_from_frame(df: pd.DataFrame) -> dict[int, dict[str, str]]:
     """{query_id: {product_id: label}} from a judgements frame."""
     out: dict[int, dict[str, str]] = defaultdict(dict)
-    for qid, pid, label in zip(df["query_id"].to_numpy(), df["product_id"].to_numpy(), df["esci_label"].to_numpy()):
+    for qid, pid, label in zip(df["query_id"].to_numpy(), df["product_id"].to_numpy(), df["esci_label"].to_numpy(), strict=True):
         out[int(qid)][str(pid)] = str(label)
     return dict(out)
 
@@ -40,10 +40,10 @@ def evaluate(ranked: dict[int, list[str]], qrels: dict[int, dict[str, str]], ks=
     """Returns {"metrics": {name: mean}, "per_query": DataFrame}. Queries missing from `ranked` score 0."""
     rows = []
     for qid, labels in qrels.items():
-        exact = {p for p, l in labels.items() if l == "E"}
+        exact = {p for p, lab in labels.items() if lab == "E"}
         top = ranked.get(qid, [])
         first = next((i + 1 for i, p in enumerate(top) if p in exact), None)
-        ideal_gains = sorted((GAINS[l] for l in labels.values()), reverse=True)
+        ideal_gains = sorted((GAINS[lab] for lab in labels.values()), reverse=True)
         row = {"query_id": qid, "n_exact": len(exact), "n_judged": len(labels), "first_exact_rank": first}
         for k in ks:
             topk = top[:k]

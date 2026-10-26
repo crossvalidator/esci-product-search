@@ -61,6 +61,7 @@ import numpy as np, pandas as pd, matplotlib.pyplot as plt
 
 import esci
 from jobs import modal_esci
+from jobs.common import modal_once   # runs a Modal job once: a saved outputs/<run>/report.json is read back instead of paying again
 
 PROCESSED, OUT = Path("data/processed/us-small"), Path("outputs")
 LOCALE, VERSION = "us", "small"
@@ -68,16 +69,6 @@ MODEL_ID = "BAAI/bge-base-en-v1.5"
 BLUE, ORANGE, AQUA, YELLOW, GREY = "#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#8a8984"
 plt.rcParams.update({"figure.dpi": 110, "axes.spines.top": False, "axes.spines.right": False, "axes.grid": True,
                      "grid.color": "#e6e5e1", "grid.linewidth": 0.6, "axes.axisbelow": True, "font.size": 9.5})
-
-def modal_once(run_name, launch, download=modal_esci.download_run):
-    "Run a Modal job once: if its report is already in outputs/, read it back instead of paying for it again."
-    p = OUT / run_name / "report.json"
-    if p.exists():
-        print(f"{run_name}: using the saved report at {p}")
-        return json.loads(p.read_text())
-    report = launch()
-    download(run_name)
-    return report
 
 if not (PROCESSED / "corpus.parquet").exists():          # 210 MB, gitignored; only needed to display real training rows here
     modal_esci.download_benchmark(LOCALE, VERSION, with_corpus=True)
@@ -161,8 +152,9 @@ SMOKE = dict(corpus_limit=20_000, max_test_queries=500, max_train_queries=2_000)
 t0 = time.time()
 with modal_esci.app.run():
     smoke = modal_once("embed-smoke", lambda: modal_esci.train_and_evaluate.remote(
-        "embed-smoke", MODEL_ID, LOCALE, VERSION, 1, 2e-5, 64, "labelled", 3, [], 20, 256,
-        SMOKE["corpus_limit"], SMOKE["max_test_queries"], SMOKE["max_train_queries"], 42))
+        run_name="embed-smoke", model=MODEL_ID, locale=LOCALE, version=VERSION, epochs=1, lr=2e-5, batch_size=64, negatives="labelled",
+        max_positives_per_query=3, max_steps=20, corpus_limit=SMOKE["corpus_limit"], max_test_queries=SMOKE["max_test_queries"],
+        max_train_queries=SMOKE["max_train_queries"], seed=42))
 print(f"done in {(time.time() - t0) / 60:.1f} min")
 
 def metric_rows(report, gpu="A10G"):
@@ -198,7 +190,8 @@ RUNS = {  # run name: (negatives, skip_before)
 t0 = time.time()
 reports = {}
 with modal_esci.app.run():
-    jobs = {name: modal_esci.train_and_evaluate.spawn(name, MODEL_ID, LOCALE, VERSION, 1, 2e-5, 64, neg, 3, [], -1, 256, 0, 0, 0, 42, skip)
+    jobs = {name: modal_esci.train_and_evaluate.spawn(run_name=name, model=MODEL_ID, locale=LOCALE, version=VERSION, epochs=1, lr=2e-5, batch_size=64,
+                                                      negatives=neg, max_positives_per_query=3, seed=42, skip_before=skip)
             for name, (neg, skip) in RUNS.items() if not (OUT / name / "report.json").exists()}
     for name in RUNS:
         reports[name] = modal_once(name, lambda name=name: jobs[name].get())
@@ -290,7 +283,7 @@ best_run = {"bge-base fine-tuned, pairs only (none)": "embed-v1-none", "bge-base
 print(f"best fine-tuned run: {best_run} ({BEST}: recall@20 {results.loc[BEST, 'recall@20']:.3f})")
 with modal_esci.app.run():
     hyb = modal_once(f"{best_run}-hybrid", lambda: modal_esci.bm25_and_hybrid.remote(
-        f"{best_run}-hybrid", LOCALE, VERSION, [f"{best_run}/rankings/after.parquet"], 0, 0, 42))
+        run_name=f"{best_run}-hybrid", locale=LOCALE, version=VERSION, dense_rankings=[f"{best_run}/rankings/after.parquet"], seed=42))
 hybrid_ft = next(v for k, v in hyb["results"].items() if k.startswith("hybrid"))
 HYB = "hybrid: BM25 + bge-base fine-tuned (best run)"
 results.loc[HYB] = pd.Series({k: v for k, v in row(HYB, hybrid_ft, None).items() if k != "system"})
@@ -379,7 +372,8 @@ code(r"""
 SEEDS = {"embed-v1-labelled": 42, "embed-v1-labelled-seed43": 43, "embed-v1-labelled-seed44": 44}
 t0 = time.time()
 with modal_esci.app.run():
-    jobs = {name: modal_esci.train_and_evaluate.spawn(name, MODEL_ID, LOCALE, VERSION, 1, 2e-5, 64, "labelled", 3, [], -1, 256, 0, 0, 0, seed, True)
+    jobs = {name: modal_esci.train_and_evaluate.spawn(run_name=name, model=MODEL_ID, locale=LOCALE, version=VERSION, epochs=1, lr=2e-5, batch_size=64,
+                                                      negatives="labelled", max_positives_per_query=3, seed=seed, skip_before=True)
             for name, seed in SEEDS.items() if not (OUT / name / "report.json").exists()}
     seed_reports = {name: modal_once(name, lambda name=name: jobs[name].get()) for name in SEEDS}
 print(f"done in {(time.time() - t0) / 60:.1f} min\n")

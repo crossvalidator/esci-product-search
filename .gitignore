@@ -11,3 +11,8 @@ outputs/
 
 # Per-cell execution logs
 logs/
+
+# Tool caches
+.pytest_cache/
+.ruff_cache/
+*.egg-info/

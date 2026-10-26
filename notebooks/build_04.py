@@ -63,6 +63,7 @@ from pathlib import Path
 import numpy as np, pandas as pd, matplotlib.pyplot as plt
 
 from jobs import modal_spark
+from jobs.common import modal_once   # runs a Modal job once: a saved outputs/<run>/report.json is read back instead of paying again
 
 OUT, PROCESSED = Path("outputs"), Path("data/processed/us-small")
 SMOKE, FULL = "spark-smoke", "spark-all"
@@ -70,16 +71,6 @@ STAGES = ["bronze", "silver", "gold", "plans", "delta", "score"]
 BLUE, ORANGE, AQUA, GREY = "#2a78d6", "#eb6834", "#1baf7a", "#8a8984"
 plt.rcParams.update({"figure.dpi": 110, "axes.spines.top": False, "axes.spines.right": False, "axes.grid": True,
                      "grid.color": "#e6e5e1", "grid.linewidth": 0.6, "axes.axisbelow": True, "font.size": 9.5})
-
-def modal_once(run_name, launch, download=modal_spark.download_run):
-    "Run a Modal job once: if its report is already in outputs/, read it back instead of paying for it again."
-    p = OUT / run_name / "report.json"
-    if p.exists():
-        print(f"{run_name}: using the saved report at {p}")
-        return json.loads(p.read_text())
-    report = launch()
-    download(run_name)
-    return report
 
 def frame(records, index=None):
     df = pd.DataFrame(records)
@@ -127,7 +118,8 @@ is the full number, and 20,888 − 349 = 20,539 kept in both builds.)
 
 code(r"""
 with modal_spark.app.run():
-    smoke = modal_once(SMOKE, lambda: modal_spark.spark_pipeline.remote(SMOKE, STAGES, ["us"], "small", 500, 42, modal_spark.DEFAULT_RANKINGS))
+    smoke = modal_once(SMOKE, lambda: modal_spark.spark_pipeline.remote(run_name=SMOKE, stages=STAGES, locales=["us"], version="small", dev_queries=500,
+                                                                        seed=42, rankings=modal_spark.DEFAULT_RANKINGS), modal_spark.download_run)
 modal_spark.print_summary(smoke)
 """)
 
@@ -177,7 +169,8 @@ Same stages on `us`, `es` and `jp`. The lake for this run is the one the rest of
 
 code(r"""
 with modal_spark.app.run():
-    full = modal_once(FULL, lambda: modal_spark.spark_pipeline.remote(FULL, STAGES, ["us", "es", "jp"], "small", 500, 42, modal_spark.DEFAULT_RANKINGS))
+    full = modal_once(FULL, lambda: modal_spark.spark_pipeline.remote(run_name=FULL, stages=STAGES, locales=["us", "es", "jp"], version="small",
+                                                                      dev_queries=500, seed=42, rankings=modal_spark.DEFAULT_RANKINGS), modal_spark.download_run)
 modal_spark.print_summary(full)
 """)
 

@@ -21,31 +21,24 @@ from pathlib import Path
 
 import modal
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # the project root, so `esci` is importable from jobs/
+from jobs.common import RATES, est_cost  # noqa: F401  (re-exported: the notebooks call modal_esci.est_cost)
 
 app = modal.App("esci-product-search")
 
+# The image is installed from jobs/requirements-gpu.txt: every package frozen (torch 2.14.1, sentence-transformers 6.2.0,
+# transformers 5.20.2, datasets 5.1.0, accelerate 1.15.0, bm25s 0.3.15 and all their dependencies), read back with `pip freeze`
+# from the image the results in FINDINGS.md were produced with. Every report.json records the versions it ran with. Bump
+# deliberately: edit the file, rebuild, re-run the smoke slices before trusting the tables again.
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .pip_install("torch>=2.4", "sentence-transformers>=5.0", "datasets>=3.0", "accelerate>=1.0", "huggingface_hub>=0.30",
-                 "pandas>=2.2", "pyarrow>=17", "bm25s>=0.2.7", "PyStemmer>=2.2")
-    .add_local_python_source("esci")          # the library package, mounted at /root/esci
+    .pip_install_from_requirements(str(Path(__file__).with_name("requirements-gpu.txt")))
+    .add_local_python_source("esci", "jobs")  # the library package and this one, mounted at /root; the container imports both
 )
 data_vol = modal.Volume.from_name("esci-data", create_if_missing=True)
 runs_vol = modal.Volume.from_name("esci-runs", create_if_missing=True)
 hf_cache = modal.Volume.from_name("hf-cache", create_if_missing=True)
 DATA, RUNS, HF = "/vol/data", "/vol/runs", "/root/.cache/huggingface"
 VOLUMES = {DATA: data_vol, RUNS: runs_vol, HF: hf_cache}
-
-# Modal list prices (USD per hour) as of October 2026, for the cost estimate printed after each run.
-# The invoice in the Modal dashboard is the measured number; this is seconds × list price.
-RATES = {"A10G": 1.10, "L4": 0.80, "L40S": 1.95, "A100-80GB": 2.50, "H100": 3.95, "cpu-core": 0.047, "memory-GiB": 0.008}
-
-
-def est_cost(seconds: float, gpu: str | None = None, cpu: float = 0, mem_gib: float = 0) -> float:
-    hours = seconds / 3600
-    return round(hours * ((RATES.get(gpu, 0) if gpu else 0) + cpu * RATES["cpu-core"] + mem_gib * RATES["memory-GiB"]), 3)
-
 
 def slice_dir(locale: str, version: str) -> str:
     return f"{DATA}/processed/{locale}-{version}"
@@ -68,7 +61,6 @@ def _finish(out: Path, t0: float) -> dict:
 @app.function(image=image, cpu=4, memory=16_384, timeout=3 * 3600, volumes={DATA: data_vol})
 def build_data(locale: str = "us", version: str = "small", dev_queries: int = 500, seed: int = 42) -> dict:
     """Download the raw ESCI files into the esci-data Volume (skipped if present) and build the benchmark."""
-    sys.path.insert(0, "/root")
     import esci
 
     t0 = time.time()
@@ -207,7 +199,7 @@ def _print_results(report: dict, gpu: str | None, cpu: float = 0, mem: float = 0
 def data(locale: str = "us", version: str = "small", dev_queries: int = 500, seed: int = 42, with_corpus: bool = False):
     """Download the raw files to the esci-data Volume, build the benchmark, bring back the small files."""
     t0 = time.time()
-    stats = build_data.remote(locale, version, dev_queries, seed)
+    stats = build_data.remote(locale=locale, version=version, dev_queries=dev_queries, seed=seed)
     dest = download_benchmark(locale, version, with_corpus=with_corpus)
     print(json.dumps({k: v for k, v in stats.items() if k in ("train", "dev", "test", "corpus", "train_judgements_removed_product_overlap")}, indent=2))
     print(f"benchmark files in {dest}/; container {stats['wall_seconds']:.0f}s, estimated cost ${est_cost(stats['wall_seconds'], None, 4, 16):.3f}; "
@@ -221,10 +213,12 @@ def baselines(run_name: str = "baselines-smoke", models: str = "BAAI/bge-base-en
     Defaults are the smoke slice; pass --corpus-limit 0 --max-test-queries 0 for the full benchmark."""
     model_list = [m for m in models.split(",") if m]
     t0 = time.time()
-    dense = evaluate_dense.with_options(gpu=gpu).remote(run_name, model_list, locale, version, None, True, corpus_limit, max_test_queries, max_seq_length, 256, seed)
+    dense = evaluate_dense.with_options(gpu=gpu).remote(run_name=run_name, models=model_list, locale=locale, version=version, corpus_limit=corpus_limit,
+                                                        max_test_queries=max_test_queries, max_seq_length=max_seq_length, seed=seed)
     _print_results(dense, gpu)
     files = [f"{run_name}/{r['rankings_file']}" for r in dense["results"].values()]
-    lex = bm25_and_hybrid.remote(f"{run_name}-bm25", locale, version, files, corpus_limit, max_test_queries, seed)
+    lex = bm25_and_hybrid.remote(run_name=f"{run_name}-bm25", locale=locale, version=version, dense_rankings=files, corpus_limit=corpus_limit,
+                                 max_test_queries=max_test_queries, seed=seed)
     _print_results(lex, None, 8, 32)
     download_run(run_name)
     download_run(f"{run_name}-bm25")
@@ -237,8 +231,9 @@ def compare(run_name: str = "compare-qwen", models: str = "Qwen/Qwen3-Embedding-
             corpus_limit: int = 0, max_test_queries: int = 0, seed: int = 42, encode_batch_size: int = 64):
     """Bigger off-the-shelf models (and optionally a fine-tuned run) on an L40S; no training."""
     t0 = time.time()
-    report = evaluate_dense.with_options(gpu=gpu).remote(run_name, [m for m in models.split(",") if m], locale, version, fine_tuned_run or None,
-                                                         query_prompt, corpus_limit, max_test_queries, 256, encode_batch_size, seed)
+    report = evaluate_dense.with_options(gpu=gpu).remote(run_name=run_name, models=[m for m in models.split(",") if m], locale=locale, version=version,
+                                                         fine_tuned_run=fine_tuned_run or None, query_prompt=query_prompt, corpus_limit=corpus_limit,
+                                                         max_test_queries=max_test_queries, encode_batch_size=encode_batch_size, seed=seed)
     _print_results(report, gpu)
     download_run(run_name)
     print(f"report in outputs/{run_name}/; round trip {(time.time() - t0) / 60:.1f} min")
@@ -246,14 +241,17 @@ def compare(run_name: str = "compare-qwen", models: str = "Qwen/Qwen3-Embedding-
 
 @app.local_entrypoint()
 def rerank(run_name: str = "rerank-smoke", candidates: str = "embed-v1-substitutes-hybrid/rankings/hybrid(bm25+after).parquet",
-           model: str = "BAAI/bge-reranker-base", gpu: str = "A10G", k: int = 20, epochs: float = 1, lr: float = 2e-5, batch_size: int = 32,
-           loss: str = "bce", compare: str = "", eval_only: bool = False, fine_tuned_run: str = "", skip_before: bool = False,
-           max_steps: int = -1, max_test_queries: int = 0, max_train_queries: int = 0, seed: int = 42, download_model: bool = False):
+           model: str = "BAAI/bge-reranker-base", gpu: str = "A10G", locale: str = "us", version: str = "small", k: int = 20, epochs: float = 1,
+           lr: float = 2e-5, batch_size: int = 32, loss: str = "bce", max_positives_per_query: int = 4, max_negatives_per_query: int = 8,
+           compare: str = "", eval_only: bool = False, fine_tuned_run: str = "", skip_before: bool = False, max_steps: int = -1,
+           max_length: int = 320, max_test_queries: int = 0, max_train_queries: int = 0, seed: int = 42, download_model: bool = False):
     """Stage 2 reranker; smoke check with --max-steps 30 --max-test-queries 500 --max-train-queries 2000."""
     t0 = time.time()
     report = rerank_train_and_evaluate.with_options(gpu=gpu).remote(
-        run_name, candidates, model, "us", "small", k, epochs, lr, batch_size, loss, 4, 8, [m for m in compare.split(",") if m],
-        eval_only, fine_tuned_run or None, skip_before, max_steps, 320, max_test_queries, max_train_queries, seed)
+        run_name=run_name, candidates=candidates, model=model, locale=locale, version=version, k=k, epochs=epochs, lr=lr, batch_size=batch_size,
+        loss=loss, max_positives_per_query=max_positives_per_query, max_negatives_per_query=max_negatives_per_query,
+        compare=[m for m in compare.split(",") if m], eval_only=eval_only, fine_tuned_run=fine_tuned_run or None, skip_before=skip_before,
+        max_steps=max_steps, max_length=max_length, max_test_queries=max_test_queries, max_train_queries=max_train_queries, seed=seed)
     for label, r in report["results"].items():
         m = r["metrics"]
         print(f"{label:44s} recall@3 {m['recall@3']:.3f}  hit@3 {m['hit@3']:.3f}  mrr@3 {m['mrr@3']:.3f}  ndcg@3 {m['ndcg@3']:.3f}  ndcg@10 {m['ndcg@10']:.3f}")
@@ -270,9 +268,10 @@ def train(run_name: str = "embed-v1", model: str = "BAAI/bge-base-en-v1.5", gpu:
           seed: int = 42, download_model: bool = False, skip_before: bool = False):
     """Fine-tune on the GPU; smoke check with --max-steps 20 --corpus-limit 20000 --max-test-queries 500 --max-train-queries 2000."""
     t0 = time.time()
-    report = train_and_evaluate.with_options(gpu=gpu).remote(run_name, model, locale, version, epochs, lr, batch_size, negatives, max_positives_per_query,
-                                                             [m for m in compare.split(",") if m], max_steps, 256, corpus_limit, max_test_queries,
-                                                             max_train_queries, seed, skip_before)
+    report = train_and_evaluate.with_options(gpu=gpu).remote(
+        run_name=run_name, model=model, locale=locale, version=version, epochs=epochs, lr=lr, batch_size=batch_size, negatives=negatives,
+        max_positives_per_query=max_positives_per_query, compare=[m for m in compare.split(",") if m], max_steps=max_steps,
+        corpus_limit=corpus_limit, max_test_queries=max_test_queries, max_train_queries=max_train_queries, seed=seed, skip_before=skip_before)
     _print_results(report, gpu)
     download_run(run_name, with_model=download_model)
     print(f"report in outputs/{run_name}/; training {report['metrics']['wall_seconds']:.0f}s; round trip {(time.time() - t0) / 60:.1f} min")

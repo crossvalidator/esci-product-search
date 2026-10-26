@@ -63,6 +63,7 @@ import numpy as np, pandas as pd, matplotlib.pyplot as plt
 
 import esci
 from jobs import modal_esci
+from jobs.common import modal_once   # runs a Modal job once: a saved outputs/<run>/report.json is read back instead of paying again
 
 PROCESSED, OUT = Path("data/processed/us-small"), Path("outputs")
 LOCALE, VERSION = "us", "small"
@@ -73,16 +74,6 @@ MINILM = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 BLUE, ORANGE, AQUA, GREY = "#2a78d6", "#eb6834", "#1baf7a", "#8a8984"
 plt.rcParams.update({"figure.dpi": 110, "axes.spines.top": False, "axes.spines.right": False, "axes.grid": True,
                      "grid.color": "#e6e5e1", "grid.linewidth": 0.6, "axes.axisbelow": True, "font.size": 9.5})
-
-def modal_once(run_name, launch, download=modal_esci.download_run):
-    "Run a Modal job once: if its report is already in outputs/, read it back instead of paying for it again."
-    p = OUT / run_name / "report.json"
-    if p.exists():
-        print(f"{run_name}: using the saved report at {p}")
-        return json.loads(p.read_text())
-    report = launch()
-    download(run_name)
-    return report
 
 data = esci.data.load_benchmark(PROCESSED)
 text = dict(zip(data["corpus"]["product_id"], data["corpus"]["text"]))
@@ -126,7 +117,9 @@ code(r"""
 t0 = time.time()
 with modal_esci.app.run():
     smoke = modal_once("rerank-smoke", lambda: modal_esci.rerank_train_and_evaluate.remote(
-        "rerank-smoke", CANDIDATES, RERANKER, LOCALE, VERSION, 20, 1, 2e-5, 32, "bce", 4, 8, [MINILM], False, None, False, 30, 320, 500, 2000, 42))
+        run_name="rerank-smoke", candidates=CANDIDATES, model=RERANKER, locale=LOCALE, version=VERSION, k=20, epochs=1, lr=2e-5, batch_size=32,
+        loss="bce", max_positives_per_query=4, max_negatives_per_query=8, compare=[MINILM], max_steps=30, max_length=320,
+        max_test_queries=500, max_train_queries=2000, seed=42))
 print(f"done in {(time.time() - t0) / 60:.1f} min")
 
 KEEP = ["recall@3", "hit@3", "mrr@3", "ndcg@3", "ndcg@10", "recall@20"]
@@ -153,10 +146,12 @@ with modal_esci.app.run():
     jobs = {}
     if not (OUT / "rerank-v1" / "report.json").exists():
         jobs["rerank-v1"] = modal_esci.rerank_train_and_evaluate.spawn(
-            "rerank-v1", CANDIDATES, RERANKER, LOCALE, VERSION, 20, 1, 2e-5, 64, "bce", 3, 5, [], False, None, False, -1, 320, 0, 0, 42)
+            run_name="rerank-v1", candidates=CANDIDATES, model=RERANKER, locale=LOCALE, version=VERSION, k=20, epochs=1, lr=2e-5, batch_size=64,
+            loss="bce", max_positives_per_query=3, max_negatives_per_query=5, max_length=320, seed=42)
     if not (OUT / "rerank-offtheshelf" / "report.json").exists():
         jobs["rerank-offtheshelf"] = modal_esci.rerank_train_and_evaluate.spawn(
-            "rerank-offtheshelf", CANDIDATES, RERANKER, LOCALE, VERSION, 20, 1, 2e-5, 32, "bce", 3, 5, [MINILM], True, None, False, -1, 320, 0, 0, 42)
+            run_name="rerank-offtheshelf", candidates=CANDIDATES, model=RERANKER, locale=LOCALE, version=VERSION, k=20, epochs=1, lr=2e-5, batch_size=32,
+            loss="bce", max_positives_per_query=3, max_negatives_per_query=5, compare=[MINILM], eval_only=True, max_length=320, seed=42)
     tuned = modal_once("rerank-v1", lambda: jobs["rerank-v1"].get())
     ots = modal_once("rerank-offtheshelf", lambda: jobs["rerank-offtheshelf"].get())
 print(f"done in {(time.time() - t0) / 60:.1f} min\n")

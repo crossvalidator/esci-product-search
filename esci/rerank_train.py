@@ -12,9 +12,9 @@ listwise on the graded gains (E 1.0, S 0.1, C 0.01, I 0) with LambdaLoss.
 
 Examples
 --------
-python esci/rerank_train.py --eval-only --compare cross-encoder/ms-marco-MiniLM-L-6-v2 BAAI/bge-reranker-base \
+python -m esci.rerank_train --eval-only --compare cross-encoder/ms-marco-MiniLM-L-6-v2 BAAI/bge-reranker-base \
     --candidates outputs/embed-v1-substitutes-hybrid/rankings/hybrid(bm25+after).parquet
-python esci/rerank_train.py --model BAAI/bge-reranker-base --epochs 1 --candidates <same>
+python -m esci.rerank_train --model BAAI/bge-reranker-base --epochs 1 --candidates <same>
 """
 
 from __future__ import annotations
@@ -86,7 +86,7 @@ def rerank(model: CrossEncoder, cands: dict[int, list[str]], queries: dict[int, 
     scores = model.predict(pairs, batch_size=batch_size, show_progress_bar=False, convert_to_numpy=True)
     scores = np.asarray(scores, dtype=np.float32).reshape(-1)
     by_q: dict[int, list[tuple[str, float]]] = {}
-    for (q, p), s in zip(index, scores):
+    for (q, p), s in zip(index, scores, strict=True):
         by_q.setdefault(q, []).append((p, float(s)))
     ranked = {q: [p for p, _ in sorted(v, key=lambda t: -t[1])] for q, v in by_q.items()}
     sc = {q: [s for _, s in sorted(v, key=lambda t: -t[1])] for q, v in by_q.items()}
@@ -95,7 +95,7 @@ def rerank(model: CrossEncoder, cands: dict[int, list[str]], queries: dict[int, 
 
 def evaluate_reranker(path: str | None, label: str, cands: dict, data: dict, text: dict, out: Path, args: argparse.Namespace) -> dict:
     """path=None scores the stage-1 order itself (the 'no reranker' row)."""
-    queries = dict(zip(data["test"]["query_id"], data["test"]["query"]))
+    queries = dict(zip(data["test"]["query_id"], data["test"]["query"], strict=True))
     qrels = esci.metrics.qrels_from_frame(data["test"])
     t0 = time.time()
     if path is None:
@@ -122,11 +122,11 @@ def evaluate_reranker(path: str | None, label: str, cands: dict, data: dict, tex
 def training_rows(data: dict, text: dict, rng: np.random.Generator, max_pos: int, max_neg: int, listwise: bool) -> tuple[list[dict], dict]:
     """Pointwise: (query, passage, label∈{0,1}). Listwise: (query, [docs], [graded gains]) per query."""
     rows, n_pos, n_neg = [], 0, 0
-    for qid, g in data["train"].groupby("query_id"):
+    for _qid, g in data["train"].groupby("query_id"):
         q = g["query"].iloc[0]
         pos = [p for p in g.loc[g["esci_label"] == "E", "product_id"] if p in text]
         neg = g[g["esci_label"] != "E"]
-        neg = [(p, l) for p, l in zip(neg["product_id"], neg["esci_label"]) if p in text]
+        neg = [(p, lab) for p, lab in zip(neg["product_id"], neg["esci_label"], strict=True) if p in text]
         if not pos or not neg:
             continue
         rng.shuffle(pos)
@@ -136,7 +136,7 @@ def training_rows(data: dict, text: dict, rng: np.random.Generator, max_pos: int
         n_neg += len(neg)
         if listwise:
             docs = [text[p] for p in pos] + [text[p] for p, _ in neg]
-            labels = [GAINS["E"]] * len(pos) + [GAINS[l] for _, l in neg]
+            labels = [GAINS["E"]] * len(pos) + [GAINS[lab] for _, lab in neg]
             rows.append({"query": q, "docs": docs, "labels": labels})
         else:
             rows.extend({"query": q, "passage": text[p], "label": 1.0} for p in pos)
@@ -147,7 +147,7 @@ def training_rows(data: dict, text: dict, rng: np.random.Generator, max_pos: int
 def dev_evaluator(data: dict, text: dict) -> CrossEncoderRerankingEvaluator:
     """Rerank each dev query's own judged list (Exact = positive, rest = negative); cheap, runs every epoch."""
     samples = []
-    for qid, g in data["dev"].groupby("query_id"):
+    for _qid, g in data["dev"].groupby("query_id"):
         pos = [text[p] for p in g.loc[g["esci_label"] == "E", "product_id"] if p in text]
         neg = [text[p] for p in g.loc[g["esci_label"] != "E", "product_id"] if p in text]
         if pos and neg:
@@ -160,12 +160,13 @@ def main() -> None:
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
     data = esci.data.load_benchmark(args.data_dir, 0, args.max_test_queries, args.max_train_queries, args.seed)
-    text = dict(zip(data["corpus"]["product_id"], data["corpus"]["text"]))
+    text = dict(zip(data["corpus"]["product_id"], data["corpus"]["text"], strict=True))
     cands = candidates_for(data["test"], Path(args.candidates), args.k)
     missing = [q for q in data["test"]["query_id"].unique() if q not in cands]
     print(f"candidates: {len(cands)} test queries × top-{args.k} from {args.candidates} ({len(missing)} test queries without candidates)", flush=True)
     gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
     report: dict = {"run_name": args.run_name, "model": args.model, "args": vars(args), "slice": data["slice"], "gpu": gpu,
+                    "versions": esci.versions("torch", "sentence-transformers", "transformers", "datasets", "accelerate"),
                     "candidates": str(args.candidates), "results": {}}
     t_all = time.time()
 

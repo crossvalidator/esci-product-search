@@ -28,14 +28,14 @@ from __future__ import annotations
 import contextlib
 import io
 import json
-import math
 import os
 import time
 from pathlib import Path
 
+from esci.data import PASSAGE_MAX_CHARS, product_text
+from esci.metrics import GAINS
+
 LOCALES = ("us", "es", "jp")
-GAINS = {"E": 1.0, "S": 0.1, "C": 0.01, "I": 0.0}
-PASSAGE_MAX_CHARS = 1200
 RAW_EXAMPLES = "shopping_queries_dataset_examples.parquet"
 RAW_PRODUCTS = "shopping_queries_dataset_products.parquet"
 STAGES = ("bronze", "silver", "gold", "plans", "delta", "score")
@@ -73,7 +73,9 @@ def get_spark(warehouse: str, driver_memory: str = "20g", shuffle_partitions: in
 
 def session_info(spark) -> dict:
     sc = spark.sparkContext
+    from esci import versions
     return {"spark_version": spark.version, "master": sc.master, "default_parallelism": sc.defaultParallelism, "host_cpus": os.cpu_count(),
+            "versions": versions("pyspark", "delta-spark", "pandas", "pyarrow"),
             "shuffle_partitions": spark.conf.get("spark.sql.shuffle.partitions"),
             "driver_memory": spark.conf.get("spark.driver.memory", "default"),
             "delta_jar_on_classpath": any("delta-spark" in j for j in _jars(spark))}
@@ -104,6 +106,17 @@ def _files(path: str) -> dict:
 def _records(df, n: int | None = None) -> list[dict]:
     rows = df.limit(n).collect() if n else df.collect()
     return [{k: (round(v, 4) if isinstance(v, float) else v) for k, v in r.asDict().items()} for r in rows]
+
+
+def _one_row_per_product(pr):
+    """One row per (locale, product_id). `dropDuplicates` keeps whichever duplicate a task meets first, which can differ
+    between runs; a window ordered by the text columns makes the choice a function of the data alone. (The ESCI products
+    file has no duplicate keys, so on this data both give the same rows; this is about determinism, not correctness.)"""
+    from pyspark.sql import Window
+    from pyspark.sql import functions as F
+
+    w = Window.partitionBy("product_locale", "product_id").orderBy("product_title", "product_brand", "product_color", "product_bullet_point", "product_description")
+    return pr.withColumn("_rn", F.row_number().over(w)).filter(F.col("_rn") == 1).drop("_rn")
 
 
 def _explain(df, mode: str = "formatted") -> str:
@@ -182,7 +195,8 @@ def passage_text_expr():
 
 def silver(spark, lake: str, locales=LOCALES, version: str = "small", dev_queries: int = 500, seed: int = 42,
            pandas_reference: str | None = None, log=print) -> dict:
-    from pyspark.sql import Window, functions as F
+    from pyspark.sql import Window
+    from pyspark.sql import functions as F
 
     t0 = time.time()
     rep: dict = {"locales": list(locales), "version": version, "dev_queries": dev_queries, "seed": seed, "timings": {}}
@@ -242,7 +256,7 @@ def silver(spark, lake: str, locales=LOCALES, version: str = "small", dev_querie
     for name in ("train", "dev", "test"):
         d = jd.filter(F.col("subset") == name)
         subsets[name] = per_locale(d, nq, nj, npd, F.sum(F.when(is_exact, 1).otherwise(0)).alias("exact_pairs"),
-                                   *[F.avg(F.when(F.col("esci_label") == l, 1.0).otherwise(0.0)).alias(f"share_{l}") for l in GAINS])
+                                   *[F.avg(F.when(F.col("esci_label") == lab, 1.0).otherwise(0.0)).alias(f"share_{lab}") for lab in GAINS])
     seen = per_locale(jd.filter(F.col("subset") == "test").select(*pkey).distinct()
                       .join(jd.filter(F.col("subset") == "train").select(*pkey).distinct(), pkey, "left_semi"), npd)
 
@@ -260,7 +274,7 @@ def silver(spark, lake: str, locales=LOCALES, version: str = "small", dev_querie
             r = subsets[name].get(loc, {})
             s[name] = {"queries": r.get("queries", 0), "judgements": r.get("judgements", 0), "products": r.get("products", 0),
                        "exact_pairs": r.get("exact_pairs", 0),
-                       "label_share": {l: round(float(r.get(f"share_{l}", 0.0)), 3) for l in GAINS}}
+                       "label_share": {lab: round(float(r.get(f"share_{lab}", 0.0)), 3) for lab in GAINS}}
         stats[loc] = s
     rep["stats"] = stats
     rep["timings"]["stats"] = round(time.time() - t1, 1)
@@ -270,7 +284,7 @@ def silver(spark, lake: str, locales=LOCALES, version: str = "small", dev_querie
     t1 = time.time()
     pr = _delta(spark, f"{lake}/bronze_products").filter(F.col("product_locale").isin(list(locales)))
     dup = pr.groupBy(*pkey).count().filter(F.col("count") > 1).count()
-    pr = pr.dropDuplicates(pkey)
+    pr = _one_row_per_product(pr)
     slice_products = raw_slice.select(*pkey).distinct()
     corpus = (slice_products.join(pr, pkey, "left")
               .withColumn("text", passage_text_expr())
@@ -307,8 +321,7 @@ def silver(spark, lake: str, locales=LOCALES, version: str = "small", dev_querie
     from pyspark.sql.functions import pandas_udf
 
     def _python_text(title, brand, color, bullets):
-        from esci.data import product_text
-        return pd.Series([product_text(t, b, c, bp) for t, b, c, bp in zip(title, brand, color, bullets)])
+        return pd.Series([product_text(t, b, c, bp) for t, b, c, bp in zip(title, brand, color, bullets, strict=True)])
     # pandas_udf infers the Series-to-Series kind from the type hints; `from __future__ import annotations` would turn
     # them into strings it cannot read, so they are attached as real objects here.
     _python_text.__annotations__ = {"title": pd.Series, "brand": pd.Series, "color": pd.Series, "bullets": pd.Series, "return": pd.Series}
@@ -340,7 +353,7 @@ def gold(spark, lake: str, log=print) -> dict:
     jd = _delta(spark, f"{lake}/silver_judgements")
     q = jd.groupBy("product_locale", "query_id", "subset").agg(
         F.first("query").alias("query"), F.count("*").alias("n_judged"),
-        *[F.sum(F.when(F.col("esci_label") == l, 1).otherwise(0)).alias(f"n_{l}") for l in GAINS])
+        *[F.sum(F.when(F.col("esci_label") == lab, 1).otherwise(0)).alias(f"n_{lab}") for lab in GAINS])
     q = q.withColumn("query_chars", F.length("query")).withColumn("query_words", F.size(F.split(F.trim("query"), r"(?U)\s+"))) \
          .withColumn("all_exact", F.col("n_E") == F.col("n_judged"))
     q.write.format("delta").mode("overwrite").partitionBy("product_locale").save(f"{lake}/gold_query_stats")
@@ -491,11 +504,12 @@ def delta_ops(spark, lake: str, seed: int = 42, log=print) -> dict:
 def score_rankings(spark, lake: str, rankings: dict[str, str], locale: str = "us", ks=(10, 20, 50), log=print) -> dict:
     """`rankings` maps a label to a rankings parquet (query_id, rank, product_id, score; rank is 1-based, 100 per query).
     Same definitions as esci.metrics.evaluate: recall@k over Exact products, hit@k, graded nDCG with unjudged = 0."""
-    from pyspark.sql import Window, functions as F
+    from pyspark.sql import Window
+    from pyspark.sql import functions as F
 
     t0 = time.time()
     jd = _delta(spark, f"{lake}/silver_judgements").filter((F.col("product_locale") == locale) & (F.col("subset") == "test"))
-    gain = F.create_map(*[x for l, g in GAINS.items() for x in (F.lit(l), F.lit(g))])
+    gain = F.create_map(*[x for lab, g in GAINS.items() for x in (F.lit(lab), F.lit(g))])
     qrels = jd.select("query_id", "product_id", "esci_label").withColumn("gain", gain[F.col("esci_label")])
     per_query = qrels.groupBy("query_id").agg(F.sum(F.when(F.col("esci_label") == "E", 1).otherwise(0)).alias("n_exact"))
     w = Window.partitionBy("query_id").orderBy(F.desc("gain"), "product_id")
@@ -508,6 +522,10 @@ def score_rankings(spark, lake: str, rankings: dict[str, str], locale: str = "us
 
     rep: dict = {"locale": locale, "test_queries": n_queries, "results": {}}
     for label, path in rankings.items():
+        if not os.path.exists(path):   # a fresh account has not run notebooks 01 and 02 yet: say so instead of failing the last stage
+            rep["results"][label] = {"path": path, "skipped": "rankings file not found; run notebooks 01 and 02 first, or pass your own run names"}
+            log(f"{label}: skipped, {path} not found")
+            continue
         r = spark.read.parquet(path).select("query_id", "rank", "product_id")
         r = r.join(qrels.select("query_id", "product_id", "esci_label", "gain"), ["query_id", "product_id"], "left") \
              .withColumn("gain", F.coalesce("gain", F.lit(0.0))).withColumn("is_exact", (F.col("esci_label") == "E").cast("int")).fillna({"is_exact": 0})

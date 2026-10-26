@@ -5,7 +5,7 @@
 - Hybrid: Reciprocal Rank Fusion of the BM25 ranking with each dense ranking passed in (saved by
   esci/embed_train.py), the standard production pattern: both retrievers propose candidates, the union is reranked.
 
-    python esci/baselines.py --data-dir data/processed/us-small --output-dir outputs/baselines \
+    python -m esci.baselines --data-dir data/processed/us-small --output-dir outputs/baselines \
         --dense-rankings outputs/baselines/rankings/BAAI__bge-base-en-v1.5.parquet
 """
 
@@ -34,9 +34,19 @@ def bm25_rankings(corpus_texts: list[str], corpus_ids, queries: list[tuple[int, 
     k = min(k, len(corpus_texts))
     idx, sc = retriever.retrieve(q_tokens, k=k, show_progress=False, n_threads=-1)
     search_s = time.time() - t1
-    ranked = {int(qid): [corpus_ids[j] for j in row] for (qid, _), row in zip(queries, idx)}
-    scores = {int(qid): row.tolist() for (qid, _), row in zip(queries, sc)}
+    ranked, scores = {}, {}
+    for (qid, _), row, srow in zip(queries, idx, sc, strict=True):
+        ranked[int(qid)], scores[int(qid)] = stable_order([corpus_ids[j] for j in row], srow.tolist())
     return ranked, scores, {"index_seconds": round(index_s, 1), "search_seconds": round(search_s, 1)}
+
+
+def stable_order(pids: list[str], scores: list[float], decimals: int = 6) -> tuple[list[str], list[float]]:
+    """Products with equal BM25 scores (identical titles are common in a catalogue) came back in an order that differed
+    between two otherwise identical runs: floating-point sums in the scoring differ by an ulp and flip the tie. recall@20 was
+    unaffected, MRR and nDCG moved in the third decimal. Ordering by the score rounded to `decimals`, then by product id,
+    makes the ranking a function of the data alone."""
+    order = sorted(range(len(pids)), key=lambda i: (-round(scores[i], decimals), pids[i]))
+    return [pids[i] for i in order], [scores[i] for i in order]
 
 
 def main() -> None:
@@ -59,11 +69,11 @@ def main() -> None:
     corpus = data["eval_corpus"]
     queries = esci.data.queries_of(data["test"])
     qrels = esci.metrics.qrels_from_frame(data["test"])
-    report: dict = {"run_name": args.run_name, "slice": data["slice"], "results": {}}
+    report: dict = {"run_name": args.run_name, "slice": data["slice"], "versions": esci.versions("bm25s", "PyStemmer", "pandas"), "results": {}}
     t_all = time.time()
 
     ranked, scores, timing = bm25_rankings(corpus["text"].tolist(), corpus["product_id"].tolist(),
-                                           list(zip(queries["query_id"], queries["query"])), args.top_k)
+                                           list(zip(queries["query_id"], queries["query"], strict=True)), args.top_k)
     res = esci.metrics.evaluate(ranked, qrels)
     esci.metrics.save_rankings(out / "rankings" / "bm25.parquet", ranked, scores)
     res["per_query"].to_parquet(out / "rankings" / "bm25.per_query.parquet", index=False)

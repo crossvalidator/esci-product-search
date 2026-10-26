@@ -16,13 +16,15 @@ esci-product-search/
   01-data-and-baselines.ipynb … 04-spark-delta-lakehouse.ipynb   the executed notebooks (the entry point)
   README.md  FINDINGS.md  SPARK.md                                this file; every result; the Spark reasoning
   esci/        the library: data.py, metrics.py, bootstrap.py, embed_train.py, rerank_train.py, baselines.py, spark.py
-  jobs/        the Modal launchers: modal_esci.py (GPU + CPU jobs), modal_spark.py (Spark + Delta Lake)
+  jobs/        the Modal launchers: modal_esci.py (GPU + CPU jobs), modal_spark.py (Spark + Delta Lake), common.py (prices, modal_once)
   notebooks/   build_01.py … build_04.py (write the notebooks) and run_notebook.py (execute cell by cell with a log)
+  tests/       pytest suite for the pure parts: metrics, the split, the passage text, the smoke slice, the bootstrap
+  .github/     CI: ruff + pytest on every push and pull request
   data/  outputs/  logs/                                           downloaded data, reports brought back from Modal, logs; gitignored
 ```
 
-Everything is run from the project root (`uv run python notebooks/build_01.py`, `uv run modal run jobs/modal_esci.py::data`);
-the notebooks import `esci` and `jobs` from there.
+Everything is run from the project root (`uv run python notebooks/build_01.py`, `uv run modal run jobs/modal_esci.py::data`).
+`uv sync` installs `esci` and `jobs` as an editable package, so the notebooks and the tests import them from anywhere.
 
 ## Setup
 
@@ -31,6 +33,7 @@ cd esci-product-search
 uv sync                                                              # ~370 MB; no torch locally
 uv run python -m ipykernel install --user --name esci-product-search --display-name "ESCI product search"
 uv run modal setup                                                   # once; logs this machine into your Modal account
+uv run ruff check . && uv run pytest -q                              # lint + the test suite (no Modal, no data, under a second)
 ```
 
 ## Run
@@ -79,15 +82,20 @@ What it costs at Modal list prices (container seconds × rate; the measured numb
 | 01 data + baselines | A10G, and an L40S for Qwen3-Embedding-8B | about 3 h, mostly the 8B encode | about $6.40 | $5.60 is the one-time Qwen3-8B pass; set `RUN_FULL_QWEN = False` in notebook 01 to skip it |
 | 02 fine-tuning (five runs + hybrid + two extra seeds) | A10G | about 1.5 h, runs in parallel | about $2.10 | |
 | 03 reranker | A10G | about 25 min | about $0.41 | |
-| 04 Spark + Delta Lake | CPU only | about 12 min | about $0.11 | |
+| 04 Spark + Delta Lake | CPU only | about 12 min | about $0.11 | two failed smoke attempts and image builds added about $0.04 |
 
-About $9 in total. Every launcher prints the container time and the estimated cost when it finishes, and the smoke
+About $9.10 in total at list price, counting the failed attempts and image builds. Every launcher prints the container time and the estimated cost when it finishes, and the smoke
 slice is the default for `baselines` so nothing big runs by accident.
 
 What to expect from the numbers: evaluation of off-the-shelf models and the Spark pipeline reproduce the tables here
-exactly (same data, same weights, fp16 inference). The fine-tuning runs are seeded, but GPU kernels are not bit-exact
+(same data, same weights, fp16 inference; the GPU image is installed from `jobs/requirements-gpu.txt`, every package frozen,
+and each `report.json` records the versions it ran with). The fine-tuning runs are seeded, but GPU kernels are not bit-exact
 across hardware, so expect recall@20 to move in the third decimal; the three seeds in `FINDINGS.md` section 6 show the
-spread to compare against.
+spread to compare against. One more caveat, found while reviewing: BM25 scores tie often (identical titles), and the order
+inside a tie once differed between two otherwise identical runs, which moved BM25 MRR and nDCG in the third decimal while
+recall@20 stayed put. The ranking is now tie-broken by rounded score, then product id (`esci/baselines.py`), so a re-run of
+the BM25 and hybrid rows can differ from the saved ones by about 0.002 in MRR and nDCG and by a few ten-thousandths in
+recall (a tie straddling the top-100 cut-off changes what Reciprocal Rank Fusion sees), and in no other way.
 
 ## Results (full benchmark: 8,955 product-disjoint test queries over 482,105 products)
 
@@ -114,7 +122,7 @@ off-the-shelf rerankers manage 0.651 / 0.435 (MiniLM) and 0.648 / 0.421 (bge-rer
 Qwen3-8B in 98.8% of 2,000 resamples on recall@20 and 100% on recall@10; three training seeds land at
 0.460 ± 0.002 recall@20. Ties are reported as ties in `FINDINGS.md`.
 
-Total Modal spend: about $8.95, of which $5.60 is the one-time Qwen3-8B catalogue pass.
+Total Modal spend: about $9.10 at list price (failed attempts and image builds included), of which $5.60 is the one-time Qwen3-8B catalogue pass.
 Full write-up, per-query analysis and costs in `FINDINGS.md`.
 
 ## Contents
@@ -134,15 +142,31 @@ Full write-up, per-query analysis and costs in `FINDINGS.md`.
 | `esci/embed_train.py` | Dense evaluation and fine-tuning (`sentence-transformers`, `MultipleNegativesRankingLoss`); negatives `labelled` / `substitutes` / `mined` / `random` / `none`; dev-set evaluator on a 20k sub-corpus; saves top-100 rankings. |
 | `esci/baselines.py` | BM25 (`bm25s`) and hybrid (RRF of BM25 with any saved dense ranking), on CPU. |
 | `jobs/modal_esci.py` | Modal app `esci-product-search`: `build_data` (CPU), `evaluate_dense` / `train_and_evaluate` / `rerank_train_and_evaluate` (GPU), `bm25_and_hybrid` (CPU); entrypoints `data`, `baselines`, `compare`, `train`, `rerank`; downloads reports and rankings to `outputs/`. |
+| `jobs/common.py` | Modal list prices, the cost estimate every launcher prints, and `modal_once` (read a saved `outputs/<run>/report.json` instead of paying for the job again), shared by the launchers and the notebooks. |
 | `jobs/modal_spark.py`, `esci/spark.py` | Modal app `esci-product-search-spark`: a CPU image with Java 17, PySpark 4.2 and the Delta 4.4 JARs baked in at build time, one `spark_pipeline` function; the Spark stages (`bronze`, `silver`, `gold`, `plans`, `delta`, `score`) as plain functions of a `SparkSession`, report checkpointed after every stage. Nothing runs on the laptop. |
 | `notebooks/run_notebook.py` | Executes a notebook cell by cell, writing the file and a timestamped log after every cell (`--start`, `--until` to resume). |
+| `tests/` | pytest suite for the parts that need no GPU and no data: the metrics on a worked example, the product-disjoint split, the passage text, the shared smoke slice, Reciprocal Rank Fusion, the paired bootstrap. Run by `.github/workflows/ci.yml` with `ruff`. |
+| `CITATION.cff` | How to cite this repository; the dataset citation is below. |
 | `data/raw/`, `data/processed/` | Downloaded and derived data; gitignored. |
 | `outputs/`, `logs/` | Reports, rankings, models brought back from Modal; execution logs; gitignored. |
 
-## Licence
+## Licence and citation
 
 Code: MIT (`LICENSE`). Data: the Amazon Shopping Queries Dataset is Apache-2.0, downloaded at run time from
 [amazon-science/esci-data](https://github.com/amazon-science/esci-data); nothing from it is redistributed here.
+If you build on the dataset, cite its paper:
+
+```bibtex
+@article{reddy2022shopping,
+  title   = {Shopping Queries Dataset: A Large-Scale {ESCI} Benchmark for Improving Product Search},
+  author  = {Reddy, Chandan K. and M{\`a}rquez, Llu{\'i}s and Valero, Fran and Rao, Nikhil and Zaragoza, Hugo and
+             Bandyopadhyay, Sambaran and Biswas, Arnab and Xing, Anlu and Subbian, Karthik},
+  journal = {arXiv preprint arXiv:2206.06588},
+  year    = {2022}
+}
+```
+
+To cite this repository, use `CITATION.cff` (GitHub renders it under "Cite this repository").
 
 ## Modal resources
 

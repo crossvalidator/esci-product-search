@@ -42,13 +42,21 @@ STAGE2 = {
 
 
 def load_matrix(files: dict[str, str], metric: str, root: Path = OUT) -> pd.DataFrame:
-    """queries × systems matrix of one per-query metric; only systems whose file exists."""
+    """queries × systems matrix of one per-query metric; only systems whose file exists. Every system was scored on the
+    same frozen test queries, so a query missing from one system means a run on a different slice, and the function
+    refuses rather than silently dropping queries from every system's interval."""
     cols = {}
     for label, rel in files.items():
         p = root / rel
         if p.exists():
             cols[label] = pd.read_parquet(p).set_index("query_id")[metric]
-    return pd.DataFrame(cols).dropna()
+    mat = pd.DataFrame(cols)
+    missing = mat.isna().any(axis=1)
+    if missing.any():
+        short = {c: int(mat[c].isna().sum()) for c in mat.columns if mat[c].isna().any()}
+        raise ValueError(f"{int(missing.sum())} of {len(mat)} queries are missing from at least one system (missing per system: {short}); "
+                         "the systems must be scored on the same test queries")
+    return mat
 
 
 def bootstrap(mat: pd.DataFrame, n: int = 2000, seed: int = 0) -> tuple[pd.DataFrame, np.ndarray]:

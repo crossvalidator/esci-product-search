@@ -58,9 +58,11 @@ def download(raw_dir: Path, names=("examples", "sources"), log=print) -> dict[st
     for name in names:
         url, size, sha = RAW_FILES[name]
         dest = raw_path(raw_dir, name)
+        marker = dest.with_name(dest.name + ".sha256")   # written once the hash has been checked: the 1.1 GB file is not re-hashed on every call
         if dest.exists() and (size is None or dest.stat().st_size == size):
             log(f"{dest.name}: already present ({dest.stat().st_size / 1e6:.0f} MB)")
         else:
+            marker.unlink(missing_ok=True)
             t0, done, mark = time.time(), 0, 0
             with urllib.request.urlopen(url) as r, open(dest, "wb") as fh:
                 while chunk := r.read(8 << 20):
@@ -70,13 +72,14 @@ def download(raw_dir: Path, names=("examples", "sources"), log=print) -> dict[st
                         mark = done
                         log(f"{dest.name}: {done / 1e6:.0f} MB in {time.time() - t0:.0f}s")
             log(f"{dest.name}: downloaded {done / 1e6:.0f} MB in {time.time() - t0:.0f}s")
-        if sha:
+        if sha and not (marker.exists() and marker.read_text().strip() == sha):
             h = hashlib.sha256()
             with open(dest, "rb") as fh:
                 while chunk := fh.read(8 << 20):
                     h.update(chunk)
             if h.hexdigest() != sha:
                 raise RuntimeError(f"{dest.name}: sha256 mismatch, delete and retry")
+            marker.write_text(sha)
         out[name] = dest
     return out
 
@@ -94,7 +97,10 @@ def load_examples(raw_dir: Path, locale: str = "us", version: str = "small") -> 
 def split_judgements(ex: pd.DataFrame, dev_queries: int = 500, seed: int = 42) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
     """Official query split, made product-disjoint: every product that appears in any test query's judged
     list is removed from the training judgements, so no test product (relevant or not) is ever seen in training.
-    Then `dev_queries` training queries are held out for model selection during training."""
+    Then `dev_queries` training queries are held out for model selection during training.
+    `train_queries_dropped_after_overlap_removal` counts the training queries that kept some judgement but lost their last
+    Exact one; a query whose every judgement was removed is not in it (the Spark build in notebook 04 reports the full number,
+    official minus kept, and the two are reconciled there)."""
     cols = ["query_id", "query", "product_id", "esci_label"]
     stats: dict = {"queries_in_slice": int(ex["query_id"].nunique()), "judgements_in_slice": int(len(ex)),
                    "products_in_slice": int(ex["product_id"].nunique())}
@@ -124,7 +130,7 @@ def split_judgements(ex: pd.DataFrame, dev_queries: int = 500, seed: int = 42) -
         e = df[df["esci_label"] == "E"].groupby("query_id").size()
         stats[name] = {"queries": int(df["query_id"].nunique()), "judgements": int(len(df)), "products": int(df["product_id"].nunique()),
                        "exact_pairs": int(len(e) and e.sum()), "exact_per_query_mean": round(float(e.mean()), 2), "exact_per_query_median": float(e.median()),
-                       "label_share": {l: round(float((df["esci_label"] == l).mean()), 3) for l in LABELS}}
+                       "label_share": {lab: round(float((df["esci_label"] == lab).mean()), 3) for lab in LABELS}}
     stats["test_products_seen_in_final_train"] = int(len(set(test["product_id"]) & set(train["product_id"])))
     return train.reset_index(drop=True), dev.reset_index(drop=True), test.reset_index(drop=True), stats
 
@@ -159,7 +165,7 @@ def build(raw_dir: Path, out_dir: Path, locale: str = "us", version: str = "smal
     products = products[products["product_id"].isin(corpus_ids)].drop_duplicates("product_id").reset_index(drop=True)
     stats["corpus_products_missing_from_products_file"] = int(len(corpus_ids) - len(products))
     products["text"] = [product_text(t, b, c, bp) for t, b, c, bp in
-                        zip(products["product_title"], products["product_brand"], products["product_color"], products["product_bullet_point"])]
+                        zip(products["product_title"], products["product_brand"], products["product_color"], products["product_bullet_point"], strict=True)]
     corpus = products.rename(columns={"product_title": "title", "product_brand": "brand", "product_color": "color"})[
         ["product_id", "title", "brand", "color", "text"]]
     corpus["n_chars"] = corpus["text"].str.len().astype("int32")
@@ -196,18 +202,21 @@ def build(raw_dir: Path, out_dir: Path, locale: str = "us", version: str = "smal
 
 def load_benchmark(data_dir: Path, corpus_limit: int = 0, max_test_queries: int = 0, max_train_queries: int = 0, seed: int = 42) -> dict:
     """Read the benchmark files. The limits define a *smoke slice*: a random subset of test queries, and an
-    evaluation corpus made of those queries' judged products plus random fillers up to corpus_limit. Same seed → same slice in every script, so BM25 and dense rankings can be fused."""
+    evaluation corpus made of those queries' judged products plus random fillers up to corpus_limit. Same seed → same slice in every script, so BM25 and dense rankings can be fused.
+    The test queries and the corpus fillers come from one generator, the training queries from a separate one: the evaluation slice
+    must not depend on whether a script passed a training cap (BM25 never does, the training CLI may)."""
     d = Path(data_dir)
     corpus = pd.read_parquet(d / "corpus.parquet")
     train, dev, test = (pd.read_parquet(d / f"{n}_judgements.parquet") for n in ("train", "dev", "test"))
     dev_corpus_ids = json.loads((d / "dev_corpus_ids.json").read_text())
     stats = json.loads((d / "stats.json").read_text())
     rng = np.random.default_rng(seed)
+    train_rng = np.random.default_rng([seed, 1])
     if max_test_queries:
         keep = rng.choice(np.sort(test["query_id"].unique()), size=min(max_test_queries, test["query_id"].nunique()), replace=False)
         test = test[test["query_id"].isin(set(keep.tolist()))].reset_index(drop=True)
     if max_train_queries:
-        keep = rng.choice(np.sort(train["query_id"].unique()), size=min(max_train_queries, train["query_id"].nunique()), replace=False)
+        keep = train_rng.choice(np.sort(train["query_id"].unique()), size=min(max_train_queries, train["query_id"].nunique()), replace=False)
         train = train[train["query_id"].isin(set(keep.tolist()))].reset_index(drop=True)
     eval_corpus = corpus
     if corpus_limit and corpus_limit < len(corpus):
@@ -226,7 +235,7 @@ def load_benchmark(data_dir: Path, corpus_limit: int = 0, max_test_queries: int 
 def training_examples(data: dict, negatives: str, rng: np.random.Generator, max_pos: int = 3, mined: dict[int, list[str]] | None = None) -> tuple[list[dict], dict]:
     """Training rows for the contrastive loss, (anchor, positive[, negative]): up to `max_pos` Exact products per query, each paired with one
     negative of the requested kind. Queries without a negative of that kind fall back to a random product."""
-    text = dict(zip(data["corpus"]["product_id"], data["corpus"]["text"]))
+    text = dict(zip(data["corpus"]["product_id"], data["corpus"]["text"], strict=True))
     all_ids = data["corpus"]["product_id"].to_numpy()
     rows, fallback = [], 0
     for qid, g in data["train"].groupby("query_id"):

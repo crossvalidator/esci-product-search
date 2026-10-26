@@ -3,6 +3,7 @@ name = "esci-product-search"
 version = "0.1.0"
 description = "Fine-tuning an embedding model (and then a reranker) for product search on the Amazon Shopping Queries Dataset (ESCI); all training and evaluation on Modal"
 requires-python = ">=3.12,<3.13"
+license = "MIT"
 
 dependencies = [
     # --- data work on the laptop (no model weights are ever loaded here) ---
@@ -22,3 +23,32 @@ dependencies = [
     "nbclient>=0.10",
     "ipywidgets>=8.0",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.14",
+]
+
+# `uv sync` installs `esci` and `jobs` as an editable package, so `import esci` works from any directory and from the
+# registered kernel; without this the imports only worked because the notebooks happen to run from the project root.
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["esci", "jobs"]
+
+[tool.ruff]
+line-length = 160
+target-version = "py312"
+extend-exclude = ["*.ipynb"]
+
+[tool.ruff.lint]
+# E/W style, F pyflakes (unused imports and names), B bugbear (likely bugs), I import order, UP modern syntax
+select = ["E", "F", "W", "B", "I", "UP"]
+ignore = ["E501"]          # the notebook builders hold long Markdown lines on purpose
+per-file-ignores = { "notebooks/build_*.py" = ["E401", "E731"] }   # one-line imports and small lambdas inside notebook cells
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

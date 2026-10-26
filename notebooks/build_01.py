@@ -253,21 +253,12 @@ Only those small files (about 20 MB) come back to `data/processed/us-small/`. Th
 
 code(r"""
 from jobs import modal_esci
-
-def modal_once(run_name, launch, download=modal_esci.download_run, report_name="report.json"):
-    "Run a Modal job once: if its report is already in outputs/, read it back instead of paying for it again."
-    p = OUT / run_name / report_name
-    if p.exists():
-        print(f"{run_name}: using the saved report at {p}")
-        return json.loads(p.read_text())
-    report = launch()
-    download(run_name)
-    return report
+from jobs.common import modal_once   # runs a Modal job once: a saved outputs/<run>/report.json is read back instead of paying again
 
 t0 = time.time()
 if not (PROCESSED / "stats.json").exists():
     with modal_esci.app.run():
-        stats = modal_esci.build_data.remote(LOCALE, VERSION, 500, 42)
+        stats = modal_esci.build_data.remote(locale=LOCALE, version=VERSION, dev_queries=500, seed=42)
     modal_esci.download_benchmark(LOCALE, VERSION)
     print(f"benchmark built and small files downloaded in {(time.time() - t0) / 60:.1f} min; container {stats['wall_seconds']:.0f}s, "
           f"estimated cost ${modal_esci.est_cost(stats['wall_seconds'], None, 4, 16):.3f}")
@@ -338,12 +329,14 @@ QWEN = ["Qwen/Qwen3-Embedding-0.6B", "Qwen/Qwen3-Embedding-8B"]
 t0 = time.time()
 with modal_esci.app.run():
     launch = lambda name, models, gpu, bs: (lambda: modal_esci.evaluate_dense.with_options(gpu=gpu).remote(
-        name, models, LOCALE, VERSION, None, True, SMOKE["corpus_limit"], SMOKE["max_test_queries"], 256, bs, 42))
+        run_name=name, models=models, locale=LOCALE, version=VERSION, corpus_limit=SMOKE["corpus_limit"], max_test_queries=SMOKE["max_test_queries"],
+        encode_batch_size=bs, seed=42))
     smoke_dense = modal_once("baselines-smoke", launch("baselines-smoke", [MODEL_ID], "A10G", 256))
     smoke_qwen = modal_once("compare-smoke", launch("compare-smoke", QWEN, "L40S", 64))
     files = [f"baselines-smoke/{r['rankings_file']}" for r in smoke_dense["results"].values()]
     smoke_lex = modal_once("baselines-smoke-bm25", lambda: modal_esci.bm25_and_hybrid.remote(
-        "baselines-smoke-bm25", LOCALE, VERSION, files, SMOKE["corpus_limit"], SMOKE["max_test_queries"], 42))
+        run_name="baselines-smoke-bm25", locale=LOCALE, version=VERSION, dense_rankings=files, corpus_limit=SMOKE["corpus_limit"],
+        max_test_queries=SMOKE["max_test_queries"], seed=42))
 print(f"smoke runs done in {(time.time() - t0) / 60:.1f} min\n")
 
 KEEP = ["recall@10", "recall@20", "recall@50", "hit@20", "mrr@20", "ndcg@20"]
@@ -381,14 +374,17 @@ FULL = dict(corpus_limit=0, max_test_queries=0)
 t0 = time.time()
 with modal_esci.app.run():
     launch = lambda name, models, gpu, bs: (lambda: modal_esci.evaluate_dense.with_options(gpu=gpu).remote(
-        name, models, LOCALE, VERSION, None, True, FULL["corpus_limit"], FULL["max_test_queries"], 256, bs, 42))
+        run_name=name, models=models, locale=LOCALE, version=VERSION, corpus_limit=FULL["corpus_limit"], max_test_queries=FULL["max_test_queries"],
+        encode_batch_size=bs, seed=42))
     qwen_job = None
     if RUN_FULL_QWEN and not (OUT / "compare-qwen" / "report.json").exists():
-        qwen_job = modal_esci.evaluate_dense.with_options(gpu="L40S").spawn("compare-qwen", QWEN, LOCALE, VERSION, None, True, 0, 0, 256, 64, 42)
+        qwen_job = modal_esci.evaluate_dense.with_options(gpu="L40S").spawn(run_name="compare-qwen", models=QWEN, locale=LOCALE, version=VERSION,
+                                                                           encode_batch_size=64, seed=42)
     full_dense = modal_once("baselines-us-small", launch("baselines-us-small", [MODEL_ID, "BAAI/bge-large-en-v1.5"], "A10G", 256))
     files = [f"baselines-us-small/{full_dense['results'][MODEL_ID]['rankings_file']}"]
     full_lex = modal_once("baselines-us-small-bm25", lambda: modal_esci.bm25_and_hybrid.remote(
-        "baselines-us-small-bm25", LOCALE, VERSION, files, FULL["corpus_limit"], FULL["max_test_queries"], 42))
+        run_name="baselines-us-small-bm25", locale=LOCALE, version=VERSION, dense_rankings=files, corpus_limit=FULL["corpus_limit"],
+        max_test_queries=FULL["max_test_queries"], seed=42))
     full_qwen = modal_once("compare-qwen", lambda: qwen_job.get()) if (qwen_job or (OUT / "compare-qwen" / "report.json").exists()) else None
 print(f"full runs done in {(time.time() - t0) / 60:.1f} min\n")
 

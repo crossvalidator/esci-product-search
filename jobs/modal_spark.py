@@ -16,17 +16,15 @@ touched; this file only reuses the two Volumes by name.
 from __future__ import annotations
 
 import json
-import sys
 import time
 from pathlib import Path
 
 import modal
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # the project root, so `esci` is importable from jobs/
+from jobs import common
 
 PYSPARK, DELTA = "4.2.0", "4.4.1"            # delta-spark 4.4.x is built for Spark 4.2; Spark 4 needs Java 17 or 21
 CPU, MEMORY_MB = 8, 32_768
-RATES = {"cpu-core": 0.047, "memory-GiB": 0.008}   # Modal list prices, USD per hour, October 2026
 
 # Resolve the Delta JARs through Ivy once, copy them next to Spark's own JARs, remove the probe table. Only the
 # io.delta / io.unitycatalog artifacts are copied: Ivy also resolves transitive JARs (Jackson 2.13, Hadoop, Parquet,
@@ -51,7 +49,7 @@ image = (
     .pip_install(f"pyspark[sql,pandas-on-spark]=={PYSPARK}", f"delta-spark=={DELTA}", "pandas>=2.2,<3", "pyarrow>=17", "numpy>=1.26")
     .run_commands(BAKE_DELTA)
     .env({"SPARK_LOCAL_IP": "127.0.0.1", "PYSPARK_PYTHON": "python", "PYSPARK_DRIVER_PYTHON": "python"})
-    .add_local_python_source("esci")          # the library package (esci.spark, esci.data), mounted at /root/esci
+    .add_local_python_source("esci", "jobs")  # the library package (esci.spark, esci.data) and this one, mounted at /root
 )
 data_vol = modal.Volume.from_name("esci-data", create_if_missing=True)
 runs_vol = modal.Volume.from_name("esci-runs", create_if_missing=True)
@@ -66,13 +64,12 @@ DEFAULT_RANKINGS = {
 
 
 def est_cost(seconds: float, cpu: float = CPU, mem_gib: float = MEMORY_MB / 1024) -> float:
-    return round(seconds / 3600 * (cpu * RATES["cpu-core"] + mem_gib * RATES["memory-GiB"]), 3)
+    return common.est_cost(seconds, None, cpu, mem_gib)
 
 
 @app.function(image=image, cpu=CPU, memory=MEMORY_MB, timeout=2 * 3600, volumes={DATA: data_vol, RUNS: runs_vol})
 def spark_pipeline(run_name: str, stages: list[str], locales: list[str], version: str = "small", dev_queries: int = 500, seed: int = 42,
                    rankings: dict[str, str] | None = None, driver_memory: str = "20g", shuffle_partitions: int = 32) -> dict:
-    sys.path.insert(0, "/root")
     from esci import spark
 
     t0 = time.time()
@@ -120,6 +117,9 @@ def print_summary(report: dict) -> None:
             print(f"  passage text vs pandas corpus: {v['identical']:,}/{v['products_compared']:,} identical")
     if "score" in st and "results" in st["score"]:
         for label, r in st["score"]["results"].items():
+            if "metrics" not in r:
+                print(f"  {label:34s} skipped: {r.get('skipped', r)}")
+                continue
             m = r["metrics"]
             print(f"  {label:34s} recall@10 {m['recall@10']:.4f}  recall@20 {m['recall@20']:.4f}  recall@50 {m['recall@50']:.4f}  hit@20 {m['hit@20']:.4f}  ndcg@20 {m['ndcg@20']:.4f}")
     secs = report.get("container_seconds", report.get("elapsed_seconds", 0)) + report.get("previous_container_seconds", 0)
@@ -130,7 +130,7 @@ def print_summary(report: dict) -> None:
 def pipeline(run_name: str = "spark-smoke", stages: str = ",".join(("bronze", "silver", "gold", "plans", "delta", "score")),
              locales: str = "us", version: str = "small", dev_queries: int = 500, seed: int = 42, score: bool = True) -> None:
     stage_list = [s for s in stages.split(",") if s]
-    report = spark_pipeline.remote(run_name, stage_list, [l for l in locales.split(",") if l], version, dev_queries, seed,
-                                   DEFAULT_RANKINGS if score else None)
+    report = spark_pipeline.remote(run_name=run_name, stages=stage_list, locales=[loc for loc in locales.split(",") if loc], version=version,
+                                   dev_queries=dev_queries, seed=seed, rankings=DEFAULT_RANKINGS if score else None)
     download_run(run_name)
     print_summary(report)

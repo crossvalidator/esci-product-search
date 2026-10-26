@@ -47,7 +47,7 @@ def main() -> None:
         for i, cell in enumerate(nb.cells):
             if i < a.start or i >= until or cell.cell_type != "code":
                 continue
-            first = next((l for l in cell.source.strip().splitlines() if l.strip()), "")[:80]
+            first = next((line for line in cell.source.strip().splitlines() if line.strip()), "")[:80]
             say(f"cell {i:2d} start | {first}")
             t0 = time.time()
             try:

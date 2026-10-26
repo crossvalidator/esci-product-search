@@ -11,8 +11,8 @@ The recipe started life on a toy corpus (18 topics, 54 passages, one right answe
 
 Examples
 --------
-python esci/embed_train.py --data-dir data/processed/us-small --eval-only --compare BAAI/bge-base-en-v1.5
-python esci/embed_train.py --data-dir data/processed/us-small --negatives labelled --epochs 1 --batch-size 64
+python -m esci.embed_train --data-dir data/processed/us-small --eval-only --compare BAAI/bge-base-en-v1.5
+python -m esci.embed_train --data-dir data/processed/us-small --negatives labelled --epochs 1 --batch-size 64
 """
 
 from __future__ import annotations
@@ -23,7 +23,6 @@ import time
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import torch
 from datasets import Dataset
 from sentence_transformers import SentenceTransformer
@@ -138,8 +137,8 @@ def evaluate_model(path: str, label: str, data: dict, prompt_key: str | None, ou
     query_s = time.time() - t2
     pids = corpus["product_id"].to_numpy()
     qids = queries["query_id"].tolist()
-    ranked = {int(q): pids[row].tolist() for q, row in zip(qids, idx)}
-    scores = {int(q): row.tolist() for q, row in zip(qids, sc)}
+    ranked = {int(q): pids[row].tolist() for q, row in zip(qids, idx, strict=True)}
+    scores = {int(q): row.tolist() for q, row in zip(qids, sc, strict=True)}
     res = esci.metrics.evaluate(ranked, esci.metrics.qrels_from_frame(data["test"]))
     safe = label.replace("/", "__")
     esci.metrics.save_rankings(out_dir / "rankings" / f"{safe}.parquet", ranked, scores)
@@ -174,7 +173,7 @@ def mine_negatives(model_path: str, data: dict, c_emb: torch.Tensor | None, args
     idx, _ = search(q_emb, c_emb, args.mine_top_k)
     pids = corpus["product_id"].to_numpy()
     exact = data["train"][data["train"]["esci_label"] == "E"].groupby("query_id")["product_id"].agg(set).to_dict()
-    mined = {int(q): [p for p in pids[row].tolist() if p not in exact.get(int(q), set())] for q, row in zip(queries["query_id"], idx)}
+    mined = {int(q): [p for p in pids[row].tolist() if p not in exact.get(int(q), set())] for q, row in zip(queries["query_id"], idx, strict=True)}
     del model, q_emb, c_emb
     torch.cuda.empty_cache()
     return mined
@@ -182,12 +181,12 @@ def mine_negatives(model_path: str, data: dict, c_emb: torch.Tensor | None, args
 
 def dev_evaluator(data: dict, prompt: str | None) -> InformationRetrievalEvaluator:
     """In-training check on the dev queries over their small sub-corpus. Cheap enough to run every epoch."""
-    text = dict(zip(data["corpus"]["product_id"], data["corpus"]["text"]))
+    text = dict(zip(data["corpus"]["product_id"], data["corpus"]["text"], strict=True))
     dev = data["dev"]
     queries = esci.data.queries_of(dev)
     relevant = dev[dev["esci_label"] == "E"].groupby("query_id")["product_id"].agg(set).to_dict()
     return InformationRetrievalEvaluator(
-        queries={str(q): t for q, t in zip(queries["query_id"], queries["query"]) if q in relevant},
+        queries={str(q): t for q, t in zip(queries["query_id"], queries["query"], strict=True) if q in relevant},
         corpus={p: text[p] for p in data["dev_corpus_ids"] if p in text},
         relevant_docs={str(q): set(v) for q, v in relevant.items()},
         accuracy_at_k=[20], precision_recall_at_k=[10, 20, 50], mrr_at_k=[20], ndcg_at_k=[20], map_at_k=[20],
@@ -202,7 +201,8 @@ def main() -> None:
     data = esci.data.load_benchmark(args.data_dir, args.corpus_limit, args.max_test_queries, args.max_train_queries, args.seed)
     print(f"benchmark slice: {data['slice']}", flush=True)
     gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
-    report: dict = {"run_name": args.run_name, "model": args.model, "args": vars(args), "slice": data["slice"], "gpu": gpu, "results": {}}
+    report: dict = {"run_name": args.run_name, "model": args.model, "args": vars(args), "slice": data["slice"], "gpu": gpu,
+                    "versions": esci.versions("torch", "sentence-transformers", "transformers", "datasets", "accelerate"), "results": {}}
     t_all = time.time()
 
     def checkpoint() -> None:
