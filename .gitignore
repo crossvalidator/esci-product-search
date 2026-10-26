@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+.ipynb_checkpoints/
+
+# Downloaded and derived data (rebuild with `uv run modal run jobs/modal_esci.py::data`)
+data/raw/
+data/processed/
+
+# Reports, rankings and models brought back from Modal
+outputs/
+
+# Per-cell execution logs
+logs/

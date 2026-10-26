@@ -1,0 +1,24 @@
+[project]
+name = "esci-product-search"
+version = "0.1.0"
+description = "Fine-tuning an embedding model (and then a reranker) for product search on the Amazon Shopping Queries Dataset (ESCI); all training and evaluation on Modal"
+requires-python = ">=3.12,<3.13"
+
+dependencies = [
+    # --- data work on the laptop (no model weights are ever loaded here) ---
+    "pandas>=2.2",
+    "pyarrow>=17",
+    "numpy>=2.0",
+    "matplotlib>=3.9",
+    "tokenizers>=0.20",        # count tokens with the bge tokenizer only; no torch locally
+    "huggingface_hub>=0.30",   # fetch that tokenizer file
+    "bm25s>=0.2.7",            # BM25 on small samples for illustration; the real runs are on Modal
+    "PyStemmer>=2.2",
+    # --- remote GPU / CPU jobs ---
+    "modal>=1.6.1",
+    # --- notebook runtime ---
+    "ipykernel>=6.29",
+    "nbformat>=5.10",
+    "nbclient>=0.10",
+    "ipywidgets>=8.0",
+]
